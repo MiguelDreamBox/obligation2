@@ -1,0 +1,195 @@
+package net.corda.samples.obligation.flows;
+
+import co.paralleluniverse.fibers.Suspendable;
+
+import java.security.PublicKey;
+import java.util.ArrayList;
+import java.util.List;
+
+import com.typesafe.config.ConfigException;
+import net.corda.core.contracts.Command;
+import net.corda.core.contracts.ContractState;
+import net.corda.core.crypto.SecureHash;
+import net.corda.core.flows.*;
+import net.corda.core.identity.Party;
+import net.corda.core.transactions.SignedTransaction;
+import net.corda.core.transactions.TransactionBuilder;
+
+import static net.corda.core.contracts.ContractsDSL.requireThat;
+
+import net.corda.samples.obligation.contracts.IOUContract;
+import net.corda.samples.obligation.states.IOUState;
+
+import static net.corda.samples.obligation.contracts.IOUContract.Commands.*;
+
+/**
+ * This is the flows which handles issuance of new IOUs on the ledger.
+ * Gathering the counter-party's signature is handled by the [CollectSignaturesFlow].
+ * Notarisation (if required) and commitment to the ledger is handled by the [FinalityFlow].
+ * The flows returns the [SignedTransaction] that was committed to the ledger.
+ */
+public class IOUIssueLoop {
+
+    @InitiatingFlow
+    @StartableByRPC
+    public static class InitiatorFlow extends FlowLogic<SignedTransaction> {
+
+        private final int amount;
+        private final Party lender;
+
+        private final int loop;
+
+        public InitiatorFlow(int amount, Party lender,int loop) {
+
+            this.amount = amount;
+            this.lender = lender;
+            this.loop = loop;
+
+        }
+
+        @Suspendable
+        @Override
+        public SignedTransaction call() throws FlowException {
+
+
+            // Step 1. Get a reference to the notary service on our network and our key pair.
+
+/** Explicit selection of notary by CordaX500Name - argument can by coded in flows or parsed from config
+ */
+            final Party notary = getServiceHub().getNetworkMapCache().getNotaryIdentities().get(0);
+            if (notary == null) {
+                throw new FlowException("The desired notary is not known");
+            }
+
+            // Generate an unsigned transaction
+            Party me = getOurIdentity();
+
+            IOUState[] states = new IOUState[loop];
+
+            for(int i = 0; i < loop;i++) {
+                states[i] = new IOUState(amount, lender, me);
+            }
+
+
+            // Step 2. Create a new issue command.
+            // Remember that a command is a CommandData object and a list of CompositeKeys
+
+
+
+            List<PublicKey> listOfKeys = new ArrayList<>();
+
+
+            listOfKeys.add(states[1].getLender().getOwningKey());
+            listOfKeys.add(states[1].getBorrower().getOwningKey());
+
+
+            final Command<Issue>[]  issueCommands = new Command[loop];
+
+            final TransactionBuilder[] builders = new TransactionBuilder[loop];
+
+            final SignedTransaction[] ptx = new SignedTransaction[loop];
+
+            List<Party>[] otherParties = new  List[loop];
+
+            List<FlowSession>[] sessions = new List[loop];
+
+            SignedTransaction[] stx = new SignedTransaction[loop];
+
+            for(int i = 0; i < loop;i++) {
+
+                issueCommands[i] = new Command<>(new Issue(), listOfKeys);
+
+                // Step 3. Create a new TransactionBuilder objects.
+                builders[i] = new TransactionBuilder(notary);
+
+                // Step 4. Add the iou as an output states, as well as a command to the transaction builder.
+                builders[i].addOutputState(states[i], IOUContract.IOU_CONTRACT_ID);
+                builders[i].addCommand(issueCommands[i]);
+                // Step 5. Verify and sign it with our KeyPair.
+                builders[i].verify(getServiceHub());
+
+                ptx[i] = getServiceHub().signInitialTransaction(builders[i]);
+
+            // Step 6. Collect the other party's signature using the CollectSignaturesFlow.Each required signer will need to
+            // respond by invoking its own SignTransactionFlow subclass to check the transaction (by implementing the checkTransaction method)
+            // and provide their signature if they are satisfied.
+
+                otherParties[i] = new ArrayList<>();
+                otherParties[i].add(states[i].getLender());
+                otherParties[i].add(states[i].getBorrower());
+                otherParties[i].remove(getOurIdentity());
+
+            // Collect all of the required signatures from other Corda nodes using the CollectSignaturesFlow
+
+                sessions[i] = new ArrayList<>();
+                for (Party otherParty : otherParties[i]) {
+                    sessions[i].add(initiateFlow(otherParty));
+                }
+
+                stx[i] = subFlow(new CollectSignaturesFlow(ptx[i], sessions[i]));
+
+                // Step 7. Assuming no exceptions, we can now finalise the transaction
+
+                subFlow(new FinalityFlow(stx[i], sessions[i]));
+            }
+
+
+
+            return null;
+        }
+
+
+    }
+
+    /**
+     * This is the flows which signs IOU issuance.
+     * The signing is handled by the [SignTransactionFlow].
+     */
+    @InitiatedBy(IOUIssueLoop.InitiatorFlow.class)
+    public static class ResponderFlow extends FlowLogic<SignedTransaction> {
+
+        private final FlowSession flowSession;
+        private SecureHash txWeJustSigned;
+
+        public ResponderFlow(FlowSession flowSession) {
+            this.flowSession = flowSession;
+        }
+
+        @Suspendable
+        @Override
+        public SignedTransaction call() throws FlowException {
+
+            class SignTxFlow extends SignTransactionFlow {
+
+                private SignTxFlow(FlowSession flowSession) {
+                    super(flowSession);
+                }
+
+                @Override
+                protected void checkTransaction(SignedTransaction stx) {
+                    requireThat(req -> {
+                        ContractState output = stx.getTx().getOutputs().get(0).getData();
+                        req.using("This must be an IOU transaction", output instanceof IOUState);
+                        return null;
+                    });
+                    // Once the transaction has verified, initialize txWeJustSignedID variable.
+                    txWeJustSigned = stx.getId();
+                }
+            }
+
+            flowSession.getCounterpartyFlowInfo().getFlowVersion();
+
+            // Create a sign transaction flows
+            SignTxFlow signTxFlow = new SignTxFlow(flowSession);
+
+            // Run the sign transaction flows to sign the transaction
+            subFlow(signTxFlow);
+
+            // Run the ReceiveFinalityFlow to finalize the transaction and persist it to the vault. As the initiator
+            // flow has already called the Finality flow, we call the ReceiveFinalityFlow and not the FinalityFlow as only one
+            // party needs to call the FinalityFlow.
+            return subFlow(new ReceiveFinalityFlow(flowSession, txWeJustSigned));
+
+        }
+    }
+}
